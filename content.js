@@ -280,7 +280,11 @@ function onImageGenerated(imgEl) {
     loadCurrentTags();
   }
   // 방금 생성이 끝났으니, 켜져 있다면 다음 생성을 바로 이어서 건다.
-  if (settingsCache.autoGenerate) setTimeout(tryAutoGenerateClick, 400);
+  // 매번 똑같은 간격으로 두드리지 않도록 500~1000ms 사이에서 무작위로 고른다.
+  if (settingsCache.autoGenerate) {
+    const nextDelay = 500 + Math.random() * 500;
+    setTimeout(tryAutoGenerateClick, nextDelay);
+  }
 }
 
 function createThumbnail(blobSrc, maxSize = 320) {
