@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "NovelAI 자동화 도우미",
+  "version": "1.9.0",
+  "description": "NovelAI 이미지 생성 페이지에서 자동 생성/저장, 캐릭터별 포지티브·네거티브 프롬프트 편집, 태그 즐겨찾기, 프롬프트 프리셋, 코드 백업/복원 기능을 제공합니다.",
+  "permissions": ["storage", "downloads", "unlimitedStorage"],
+  "host_permissions": ["https://novelai.net/*"],
+  "action": {
+    "default_title": "NovelAI 자동화 도우미 (클릭해서 패널 열기/닫기)"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://novelai.net/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
