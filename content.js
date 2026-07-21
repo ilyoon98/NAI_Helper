@@ -1182,6 +1182,12 @@ function loadCurrentTagsWhenReady(maxAttempts = 20, intervalMs = 500) {
 
 function setupCurrentTagsContainer(panel) {
   const listEl = panel.querySelector('#nah-current-tags');
+  // 태그를 드래그하는 동안엔 브라우저가 휠 스크롤을 무시하는 경우가 많아서,
+  // 휠 이벤트를 직접 받아 컨테이너를 스크롤시켜 준다 (드래그 중이 아닐 때도 자연스럽게 동작).
+  listEl.addEventListener('wheel', (e) => {
+    if (e.deltaY === 0) return;
+    listEl.scrollTop += e.deltaY;
+  }, { passive: true });
   listEl.addEventListener('dragover', (e) => {
     e.preventDefault();
     e.dataTransfer.dropEffect = 'move';
