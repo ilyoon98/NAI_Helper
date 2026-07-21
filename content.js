@@ -3,19 +3,53 @@
 let settingsCache = { autoGenerate: false, autoSave: false };
 const savedImageSrcs = new Set();
 
+// 확장 프로그램이 리로드되면 탭에 남아있던 옛 content script의 chrome.* 호출이
+// "Extension context invalidated" 에러를 뿜는다. 호출 전에 살아있는지 확인한다.
+function extAlive() {
+  try {
+    return !!(chrome.runtime && chrome.runtime.id);
+  } catch (e) {
+    return false;
+  }
+}
+
+function safeStorageSet(obj, callback) {
+  if (!extAlive()) return;
+  try {
+    chrome.storage.local.set(obj, callback);
+  } catch (e) {
+    /* 컨텍스트가 방금 죽었으면 조용히 무시 */
+  }
+}
+
+// 이 시각 전에는 자동 생성 클릭을 보류한다 (새로고침 직후 429 방지용).
+let autoGenerateHoldUntil = 0;
+// 다음 자동 생성 클릭이 예약된 시각 (패널의 카운트다운 표시용).
+let nextGenerateAt = 0;
+
 chrome.storage.local.get(['autoGenerate', 'autoSave'], (data) => {
   settingsCache.autoGenerate = !!data.autoGenerate;
   settingsCache.autoSave = !!data.autoSave;
-  // 페이지를 새로고침했는데 자동 생성이 이미 켜져 있던 상태라면 바로 이어서 시작한다.
-  if (settingsCache.autoGenerate) tryAutoGenerateClick();
+  // 페이지를 새로고침했는데 자동 생성이 이미 켜져 있던 상태라면 이어서 시작하되,
+  // 새로고침 직전에 걸어둔 생성이 아직 서버에서 돌고 있을 수 있으므로
+  // (429 "Concurrent generation is locked" 방지) 8초 기다렸다가 시작한다.
+  if (settingsCache.autoGenerate) {
+    autoGenerateHoldUntil = Date.now() + 8000;
+    nextGenerateAt = Date.now() + 8100;
+    setTimeout(tryAutoGenerateClick, 8100);
+  }
 });
 
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== 'local') return;
   if ('autoGenerate' in changes) {
     settingsCache.autoGenerate = !!changes.autoGenerate.newValue;
-    // 체크박스를 막 켰다면 다음 완성 신호를 기다리지 않고 바로 첫 생성을 시작한다.
-    if (settingsCache.autoGenerate) tryAutoGenerateClick();
+    // 체크박스를 직접 막 켠 경우엔 보류 없이 바로 첫 생성을 시작한다.
+    // (직전 생성이 아직 서버에서 돌고 있으면 tryAutoGenerateClick이 알아서 건너뛴다.)
+    if (settingsCache.autoGenerate) {
+      autoGenerateHoldUntil = 0;
+      tryAutoGenerateClick();
+    }
   }
   if ('autoSave' in changes) settingsCache.autoSave = !!changes.autoSave.newValue;
 });
@@ -193,11 +227,20 @@ function getGenerateButton() {
 
 let missingGenerateButtonWarned = false;
 
+// 우리가 Generate를 클릭한 시각. 0이면 진행 중인 생성이 없다는 뜻.
+// 이 값이 살아있는 동안엔 추가 클릭을 하지 않아 429(Concurrent generation is locked)를 막는다.
+let generationInFlightSince = 0;
+const GENERATION_TIMEOUT_MS = 90000; // 완성 신호가 이만큼 안 오면 실패로 보고 재시도 허용
+
 function tryAutoGenerateClick() {
   if (!settingsCache.autoGenerate) return;
+  if (Date.now() < autoGenerateHoldUntil) return;
+  if (generationInFlightSince && Date.now() - generationInFlightSince < GENERATION_TIMEOUT_MS) return;
   const btn = getGenerateButton();
   if (btn && !btn.disabled) {
     btn.click();
+    generationInFlightSince = Date.now();
+    nextGenerateAt = 0; // 이제 생성 중 — 카운트다운 대신 "생성 중" 표시
     missingGenerateButtonWarned = false;
   } else if (!btn && !missingGenerateButtonWarned) {
     missingGenerateButtonWarned = true;
@@ -232,9 +275,59 @@ function addTagToPrompt(tag, target, mode) {
   return setPromptText(next, target, mode);
 }
 
+// --- 429(Concurrent generation is locked) 감지 & 백오프 ---
+// NovelAI가 페이지에 띄우는 에러 문구를 감지하면: 재시도를 점점 길게 미루고(15초→30초),
+// 연속 3회면 자동 반복 생성을 스스로 꺼서 서버를 계속 두드리지 않는다 (밴 위험 예방).
+let consecutive429 = 0;
+let last429At = 0;
+
+function setAutoStatus(text, isError) {
+  setInlineStatus('nah-auto-status', text, isError);
+}
+
+function onGenerationError() {
+  const now = Date.now();
+  if (now - last429At < 3000) return; // 같은 토스트가 여러 노드로 잡히는 중복 방지
+  last429At = now;
+  if (!settingsCache.autoGenerate) return;
+  generationInFlightSince = 0; // 그 클릭은 서버가 거절했으므로 진행 중 아님
+  consecutive429 += 1;
+  clearTimeout(nextGenerateTimer);
+  if (consecutive429 >= 3) {
+    consecutive429 = 0;
+    safeStorageSet({ autoGenerate: false });
+    const cb = document.getElementById('nah-auto-generate');
+    if (cb) cb.checked = false;
+    setAutoStatus('생성 잠금(429)이 연속 3회 발생해 자동 반복 생성을 껐어요. 잠시 후 직접 다시 켜주세요.', true);
+    console.warn('[NovelAI 도우미] 429 연속 발생 — 자동 반복 생성을 자동으로 껐어요.');
+    return;
+  }
+  const backoff = 15000 * consecutive429;
+  autoGenerateHoldUntil = now + backoff;
+  nextGenerateAt = now + backoff + 200;
+  nextGenerateTimer = setTimeout(tryAutoGenerateClick, backoff + 200);
+  setAutoStatus(`생성 잠금(429) 감지 — ${Math.round(backoff / 1000)}초 쉬었다가 다시 시도해요.`, true);
+}
+
 // --- Auto-generate: 폴링 대신 이미지 완성 이벤트(onImageGenerated)를 신호로 다음 생성을 건다.
 // 생성이 실패해 이미지가 끝내 안 뜨는 경우를 대비한 저빈도 안전망만 유지한다.
 setInterval(tryAutoGenerateClick, 5000);
+
+// --- 다음 생성까지 남은 시간 표시 (0.1초 단위) ---
+setInterval(() => {
+  const el = document.getElementById('nah-next-gen');
+  if (!el) return;
+  if (!settingsCache.autoGenerate) {
+    if (el.textContent) el.textContent = '';
+    return;
+  }
+  if (generationInFlightSince) {
+    el.textContent = '생성 중…';
+    return;
+  }
+  const remain = Math.max(nextGenerateAt, autoGenerateHoldUntil) - Date.now();
+  el.textContent = remain > 0 ? `다음 생성 ${(remain / 1000).toFixed(1)}초 전` : '대기 중';
+}, 100);
 
 // --- Auto-save ---
 function buildFilename() {
@@ -256,6 +349,7 @@ function trySaveImage(imgEl) {
     .then((blob) => {
       const reader = new FileReader();
       reader.onload = () => {
+        if (!extAlive()) return;
         chrome.runtime.sendMessage({
           type: 'download',
           dataUrl: reader.result,
@@ -270,20 +364,27 @@ function trySaveImage(imgEl) {
 const seenGenerationSrcs = new Set();
 let lastGeneratedImageSrc = null;
 
+let nextGenerateTimer = null;
+
 function onImageGenerated(imgEl) {
   const src = imgEl.src;
   if (!src || !src.startsWith('blob:')) return;
   if (seenGenerationSrcs.has(src)) return;
   seenGenerationSrcs.add(src);
   lastGeneratedImageSrc = src;
+  generationInFlightSince = 0; // 생성 완료 — 다음 클릭 허용
+  consecutive429 = 0; // 정상 완성됐으니 429 연속 카운트 리셋
   if (panelEl && !panelEl.classList.contains('nah-hidden')) {
     loadCurrentTags();
   }
   // 방금 생성이 끝났으니, 켜져 있다면 다음 생성을 바로 이어서 건다.
   // 매번 똑같은 간격으로 두드리지 않도록 500~1000ms 사이에서 무작위로 고른다.
+  // 한 번의 생성이 이미지 여러 장/중복 이벤트를 낼 수 있으므로 타이머는 항상 1개만 유지한다.
   if (settingsCache.autoGenerate) {
+    clearTimeout(nextGenerateTimer);
     const nextDelay = 500 + Math.random() * 500;
-    setTimeout(tryAutoGenerateClick, nextDelay);
+    nextGenerateAt = Date.now() + nextDelay;
+    nextGenerateTimer = setTimeout(tryAutoGenerateClick, nextDelay);
   }
 }
 
@@ -322,6 +423,10 @@ const imageObserver = new MutationObserver((mutations) => {
     }
     m.addedNodes.forEach((node) => {
       if (node.nodeType !== 1) return;
+      // NovelAI가 띄우는 429 에러 토스트 감지
+      if (/(Concurrent generation is locked|Error generating image:\s*429)/i.test(node.textContent || '')) {
+        onGenerationError();
+      }
       if (node.matches && node.matches('img.image-grid-image')) {
         handleImage(node);
       } else if (node.querySelectorAll) {
@@ -374,6 +479,8 @@ const PANEL_STYLES = `
   border-bottom: 1px solid #3a3a5c;
 }
 #nah-header .nah-title { font-weight: 600; color: #f5d76e; font-size: 13px; }
+#nah-version { font-size: 11px; color: #7a7a99; }
+#nah-next-gen { font-size: 11px; color: #f5d76e; }
 #nah-close {
   background: transparent;
   border: none;
@@ -438,6 +545,16 @@ const PANEL_STYLES = `
 #nah-panel .nah-preset-actions button.nah-delete:hover { background: #9a4c4c; }
 #nah-panel .nah-empty { color: #7a7a99; font-style: italic; padding: 6px 0; }
 #nah-panel .nah-status { margin-top: 8px; font-size: 11px; color: #7a7a99; min-height: 14px; }
+#nah-panel .nah-inline-status {
+  display: none; margin: 6px 0 2px; padding: 6px 9px; border-radius: 5px;
+  font-size: 12px; line-height: 1.4;
+}
+#nah-panel .nah-inline-status.nah-error {
+  display: block; background: #3a1c1c; border: 1px solid #9a4c4c; color: #f0997b; font-weight: 600;
+}
+#nah-panel .nah-inline-status.nah-info {
+  display: block; background: #1c2e24; border: 1px solid #3c7a52; color: #7bd8a5;
+}
 #nah-panel input[type="checkbox"] { width: 16px; height: 16px; }
 #nah-panel .nah-tag-list { display: flex; flex-wrap: wrap; gap: 6px; }
 #nah-panel .nah-tag-chip {
@@ -456,14 +573,41 @@ const PANEL_STYLES = `
   display: flex; align-items: center; justify-content: space-between;
 }
 #nah-current-tags {
-  flex-direction: column; flex-wrap: nowrap; max-height: 240px; overflow-y: auto; padding-right: 2px;
+  max-height: 260px; overflow-y: auto; padding-right: 2px; align-content: flex-start;
 }
-#nah-current-tags .nah-tag-chip { width: 100%; box-sizing: border-box; }
-#nah-current-tags .nah-tag-chip .nah-text { max-width: none; flex: 1; }
+#nah-current-tags .nah-tag-chip {
+  padding: 3px 10px; cursor: pointer; user-select: none;
+}
+#nah-current-tags .nah-tag-chip .nah-text { max-width: 220px; }
 #nah-current-tags .nah-tag-chip.nah-dragging { opacity: 0.4; }
-#nah-current-tags .nah-tag-chip.nah-drag-over-top { box-shadow: inset 0 2px 0 0 #f5d76e; }
-#nah-current-tags .nah-tag-chip.nah-drag-over-bottom { box-shadow: inset 0 -2px 0 0 #f5d76e; }
-#nah-current-tags .nah-grip { cursor: grab; color: #7a7a99; font-size: 12px; margin-right: 2px; }
+#nah-current-tags .nah-tag-chip.nah-drag-over-left { box-shadow: inset 2px 0 0 0 #f5d76e; }
+#nah-current-tags .nah-tag-chip.nah-drag-over-right { box-shadow: inset -2px 0 0 0 #f5d76e; }
+#nah-current-tags .nah-tag-chip.nah-selected { border-color: #f5d76e; background: #33334d; }
+#nah-current-tags .nah-tag-chip.nah-weight-up { background: #3a2318; border-color: #8a4a2c; }
+#nah-current-tags .nah-tag-chip.nah-weight-up .nah-text { color: #f0997b; }
+#nah-current-tags .nah-tag-chip.nah-weight-down { background: #16283a; border-color: #2c5a8a; }
+#nah-current-tags .nah-tag-chip.nah-weight-down .nah-text { color: #85b7eb; }
+#nah-current-tags .nah-tag-chip.nah-weight-up.nah-selected,
+#nah-current-tags .nah-tag-chip.nah-weight-down.nah-selected { border-color: #f5d76e; }
+#nah-panel .nah-tag-toolbar { display: flex; gap: 6px; margin-bottom: 8px; align-items: center; }
+#nah-panel .nah-tag-toolbar input[type="text"] {
+  flex: 1; min-width: 0; background: #262640; border: 1px solid #3a3a5c;
+  color: #e6e6f0; border-radius: 4px; padding: 4px 7px; font-size: 12px;
+}
+#nah-panel .nah-tag-toolbar label {
+  display: flex; align-items: center; gap: 4px; font-size: 11px; color: #b9b9d6;
+  cursor: pointer; white-space: nowrap;
+}
+#nah-panel .nah-tag-toolbar label input { width: 13px; height: 13px; }
+#nah-panel .nah-tag-actionbar {
+  display: none; align-items: center; gap: 6px; background: #262640;
+  border: 1px solid #f5d76e55; border-radius: 6px; padding: 5px 8px; margin-bottom: 8px;
+}
+#nah-panel .nah-tag-actionbar.nah-visible { display: flex; }
+#nah-panel .nah-tag-actionbar .nah-selected-name {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 12px; color: #f5d76e;
+}
 #nah-panel .nah-target-select {
   width: 100%; background: #262640; border: 1px solid #3a3a5c; color: #e6e6f0;
   border-radius: 4px; padding: 5px 7px; margin-bottom: 8px; font-size: 12px;
@@ -499,22 +643,30 @@ function buildPanel() {
   panel.innerHTML = `
     <div id="nah-header">
       <span class="nah-title">NovelAI 자동화 도우미</span>
-      <button id="nah-close" title="닫기">×</button>
+      <span style="display:flex; align-items:center; gap:4px;">
+        <span id="nah-version"></span>
+        <button id="nah-close" title="닫기">×</button>
+      </span>
     </div>
     <div id="nah-body">
       <div class="nah-row">
         <label for="nah-auto-generate">자동 반복 생성</label>
-        <input type="checkbox" id="nah-auto-generate" />
+        <span style="display:flex; align-items:center; gap:8px;">
+          <span id="nah-next-gen"></span>
+          <input type="checkbox" id="nah-auto-generate" />
+        </span>
       </div>
       <div class="nah-row">
         <label for="nah-auto-save">자동 저장 (다운로드)</label>
         <input type="checkbox" id="nah-auto-save" />
       </div>
+      <div class="nah-inline-status" id="nah-auto-status"></div>
 
       <section data-key="favorites">
         <div class="nah-section-title" data-toggle="favorites"><span class="nah-chevron">▾</span>즐겨찾기 태그</div>
         <div class="nah-section-body">
           <div class="nah-tag-list" id="nah-favorite-tags"></div>
+          <div class="nah-inline-status" id="nah-fav-status"></div>
         </div>
       </section>
 
@@ -529,7 +681,17 @@ function buildPanel() {
             <button class="nah-mode-btn" id="nah-mode-positive" data-mode="positive">포지티브</button>
             <button class="nah-mode-btn" id="nah-mode-negative" data-mode="negative">네거티브</button>
           </div>
+          <div class="nah-tag-toolbar">
+            <input type="text" id="nah-tag-search" placeholder="태그 검색" />
+            <label><input type="checkbox" id="nah-weighted-only" />강조만</label>
+          </div>
+          <div class="nah-tag-actionbar" id="nah-tag-actionbar">
+            <span class="nah-selected-name" id="nah-selected-name"></span>
+            <button class="nah-add" id="nah-selected-fav">즐겨찾기</button>
+            <button class="nah-remove" id="nah-selected-delete">삭제</button>
+          </div>
           <div class="nah-tag-list" id="nah-current-tags"></div>
+          <div class="nah-inline-status" id="nah-tags-status"></div>
         </div>
       </section>
 
@@ -541,6 +703,7 @@ function buildPanel() {
             <button id="nah-save-preset">현재 프롬프트 저장</button>
           </div>
           <div id="nah-preset-list"></div>
+          <div class="nah-inline-status" id="nah-preset-status"></div>
           <input type="file" id="nah-preset-thumb-file" accept="image/*" style="display:none" />
         </div>
       </section>
@@ -557,6 +720,7 @@ function buildPanel() {
           <textarea id="nah-import-code" class="nah-code-area" placeholder="여기에 백업 코드를 붙여넣으세요"></textarea>
           <button id="nah-import-btn" type="button">코드로 가져오기</button>
           <div class="nah-backup-hint">가져오기는 기존 프리셋·즐겨찾기를 지우지 않고 새로 추가만 해요.</div>
+          <div class="nah-inline-status" id="nah-backup-status"></div>
         </div>
       </section>
 
@@ -564,6 +728,13 @@ function buildPanel() {
     </div>
   `;
   document.body.appendChild(panel);
+  // manifest.json의 version을 그대로 읽어오므로, 버전을 올리면 여기도 자동 반영된다.
+  try {
+    const versionEl = panel.querySelector('#nah-version');
+    if (versionEl && extAlive()) versionEl.textContent = `v${chrome.runtime.getManifest().version}`;
+  } catch (e) {
+    /* 버전 표시는 실패해도 치명적이지 않음 */
+  }
   return panel;
 }
 
@@ -572,6 +743,48 @@ function setStatus(text) {
   if (!statusEl) return;
   statusEl.textContent = text;
   if (text) setTimeout(() => { statusEl.textContent = ''; }, 2500);
+}
+
+// 각 카드(섹션) 안에 표시되는 상태 메시지. 에러는 빨간 강조, 일반 안내는 초록.
+// 카드마다 타이머를 따로 관리해 서로 지우지 않게 한다.
+const inlineStatusTimers = {};
+function setInlineStatus(elId, text, isError) {
+  const el = document.getElementById(elId);
+  if (!el) return;
+  clearTimeout(inlineStatusTimers[elId]);
+  el.textContent = text;
+  el.className = `nah-inline-status ${isError ? 'nah-error' : 'nah-info'}`;
+  inlineStatusTimers[elId] = setTimeout(() => {
+    el.textContent = '';
+    el.className = 'nah-inline-status';
+  }, isError ? 4000 : 3000);
+}
+
+function setPresetStatus(text, isError) {
+  setInlineStatus('nah-preset-status', text, isError);
+}
+function setFavStatus(text, isError) {
+  setInlineStatus('nah-fav-status', text, isError);
+}
+function setTagsStatus(text, isError) {
+  setInlineStatus('nah-tags-status', text, isError);
+}
+function setBackupStatus(text, isError) {
+  setInlineStatus('nah-backup-status', text, isError);
+}
+
+// 저장소(chrome.storage)를 써야 하는 동작 전에 컨텍스트가 살아있는지 확인하고,
+// 죽어있으면 해당 카드에 빨간 안내를 띄운다. (확장 리로드 후 탭 미새로고침 상황)
+const CONTEXT_DEAD_MSG = '확장 프로그램이 리로드됐어요. 페이지를 새로고침(F5)한 뒤 다시 시도해주세요.';
+function guardAlive(statusSetter) {
+  if (extAlive()) return true;
+  statusSetter(CONTEXT_DEAD_MSG, true);
+  return false;
+}
+
+// 프리셋 적용/저장 메시지에서 대상 이름을 사람이 읽기 좋게 만든다.
+function describeTarget(target) {
+  return target === 'base' ? 'Base Prompt' : `캐릭터 ${target}`;
 }
 
 let thumbPreviewEl = null;
@@ -648,14 +861,14 @@ function renderPresets(presets) {
     applyBtn.textContent = '적용';
     applyBtn.addEventListener('click', async () => {
       if (scope === 'character' && currentPromptTarget === 'base') {
-        setStatus('캐릭터용 프리셋이에요. 위에서 캐릭터를 먼저 선택해주세요.');
+        setPresetStatus('캐릭터용 프리셋이에요. 현재 프롬프트 태그에서 캐릭터를 먼저 선택해주세요.', true);
         return;
       }
       const target = scope === 'character' ? currentPromptTarget : 'base';
       applyBtn.disabled = true;
       try {
         await applyPositiveAndNegative(preset.text, preset.negativeText, target);
-        setStatus(`"${preset.name}" 적용됨`);
+        setPresetStatus(`${describeTarget(target)}에 "${preset.name}" 프리셋을 적용했어요.`, false);
         loadCurrentTags();
       } finally {
         applyBtn.disabled = false;
@@ -675,11 +888,12 @@ function renderPresets(presets) {
     deleteBtn.className = 'nah-delete';
     deleteBtn.textContent = '삭제';
     deleteBtn.addEventListener('click', () => {
+      if (!guardAlive(setPresetStatus)) return;
       chrome.storage.local.get(['presets'], (data) => {
         const next = (data.presets || []).filter((p) => p.id !== preset.id);
         chrome.storage.local.set({ presets: next }, () => {
           renderPresets(next);
-          setStatus('삭제됨');
+          setPresetStatus(`"${preset.name}" 프리셋을 삭제했어요.`, false);
         });
       });
     });
@@ -730,7 +944,7 @@ function renderFavoriteTags(favorites) {
       if (!ok) return;
       await delay(80);
       if (addTagToPrompt(fav.tag, currentPromptTarget, mode)) {
-        setStatus(`"${fav.tag}" 추가됨`);
+        setFavStatus(`${describeTarget(currentPromptTarget)}에 "${fav.tag}" 추가했어요.`, false);
         currentPromptMode = mode;
         loadCurrentTags();
       }
@@ -740,11 +954,12 @@ function renderFavoriteTags(favorites) {
     removeBtn.className = 'nah-remove';
     removeBtn.textContent = '삭제';
     removeBtn.addEventListener('click', () => {
+      if (!guardAlive(setFavStatus)) return;
       chrome.storage.local.get(['tagFavorites'], (data) => {
         const next = (data.tagFavorites || []).filter((f) => f.id !== fav.id);
         chrome.storage.local.set({ tagFavorites: next }, () => {
           renderFavoriteTags(next);
-          setStatus('삭제됨');
+          setFavStatus(`"${fav.tag}" 즐겨찾기를 삭제했어요.`, false);
         });
       });
     });
@@ -762,16 +977,17 @@ function loadFavoriteTags() {
 }
 
 function addTagToFavorites(tag, mode) {
+  if (!guardAlive(setTagsStatus)) return;
   chrome.storage.local.get(['tagFavorites'], (data) => {
     const favorites = data.tagFavorites || [];
     if (favorites.some((f) => f.tag === tag && (f.mode || 'positive') === mode)) {
-      setStatus('이미 즐겨찾기에 있어요.');
+      setTagsStatus('이미 즐겨찾기에 있어요.', true);
       return;
     }
     favorites.push({ id: `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`, tag, mode });
     chrome.storage.local.set({ tagFavorites: favorites }, () => {
       renderFavoriteTags(favorites);
-      setStatus(`"${tag}" 즐겨찾기 저장됨`);
+      setTagsStatus(`"${tag}" 즐겨찾기에 저장했어요.`, false);
     });
   });
 }
@@ -779,6 +995,29 @@ function addTagToFavorites(tag, mode) {
 let currentTagsState = [];
 let currentPromptMode = 'positive';
 let currentPromptTarget = 'base';
+let selectedTagIndex = null; // currentTagsState 기준 인덱스
+let tagSearchQuery = '';
+let weightedOnlyFilter = false;
+
+// "1.9::trap::" 같은 가중치 문법에서 숫자만 뽑아낸다. 없으면 null.
+function parseTagWeight(tag) {
+  const m = tag.match(/^(\d+(?:\.\d+)?)\s*::/);
+  return m ? parseFloat(m[1]) : null;
+}
+
+function isTagFilterActive() {
+  return tagSearchQuery.trim() !== '' || weightedOnlyFilter;
+}
+
+function updateTagActionBar() {
+  const bar = document.getElementById('nah-tag-actionbar');
+  const nameEl = document.getElementById('nah-selected-name');
+  if (!bar || !nameEl) return;
+  const valid = selectedTagIndex !== null && selectedTagIndex < currentTagsState.length;
+  bar.classList.toggle('nah-visible', valid);
+  nameEl.textContent = valid ? currentTagsState[selectedTagIndex] : '';
+  nameEl.title = nameEl.textContent;
+}
 
 function applyCurrentTagsToPrompt() {
   setPromptText(currentTagsState.join(', '), currentPromptTarget, currentPromptMode);
@@ -797,6 +1036,7 @@ function moveTag(fromIndex, insertAt) {
 function renderCurrentTags() {
   const listEl = document.getElementById('nah-current-tags');
   listEl.innerHTML = '';
+  updateTagActionBar();
   if (!currentTagsState.length) {
     const empty = document.createElement('div');
     empty.className = 'nah-empty';
@@ -804,75 +1044,90 @@ function renderCurrentTags() {
     listEl.appendChild(empty);
     return;
   }
-  currentTagsState.forEach((tag, idx) => {
+
+  // 검색어·강조 필터를 통과한 태그만 보여준다. 원본 순서는 건드리지 않고,
+  // 각 칩이 currentTagsState의 몇 번째인지(origIdx)를 기억해 둔다.
+  const query = tagSearchQuery.trim().toLowerCase();
+  const visible = [];
+  currentTagsState.forEach((tag, origIdx) => {
+    if (query && !tag.toLowerCase().includes(query)) return;
+    if (weightedOnlyFilter) {
+      const w = parseTagWeight(tag);
+      if (w === null || w <= 1.0) return;
+    }
+    visible.push({ tag, origIdx });
+  });
+
+  if (!visible.length) {
+    const empty = document.createElement('div');
+    empty.className = 'nah-empty';
+    empty.textContent = '조건에 맞는 태그가 없어요.';
+    listEl.appendChild(empty);
+    return;
+  }
+
+  // 필터가 걸려 있으면 드래그 정렬은 잠시 끈다 (보이는 순서와 실제 순서가 달라서 헷갈림 방지).
+  const dragEnabled = !isTagFilterActive();
+
+  visible.forEach(({ tag, origIdx }) => {
     const chip = document.createElement('div');
     chip.className = 'nah-tag-chip';
-    chip.draggable = true;
+    const weight = parseTagWeight(tag);
+    if (weight !== null && weight > 1.0) chip.classList.add('nah-weight-up');
+    else if (weight !== null && weight < 1.0) chip.classList.add('nah-weight-down');
+    if (selectedTagIndex === origIdx) chip.classList.add('nah-selected');
+    chip.draggable = dragEnabled;
 
-    chip.addEventListener('dragstart', (e) => {
-      e.dataTransfer.effectAllowed = 'move';
-      e.dataTransfer.setData('text/plain', String(idx));
-      chip.classList.add('nah-dragging');
-    });
-    chip.addEventListener('dragend', () => {
-      chip.classList.remove('nah-dragging');
-      listEl.querySelectorAll('.nah-drag-over-top, .nah-drag-over-bottom').forEach((el) => {
-        el.classList.remove('nah-drag-over-top', 'nah-drag-over-bottom');
-      });
-    });
-    chip.addEventListener('dragover', (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      e.dataTransfer.dropEffect = 'move';
-      const rect = chip.getBoundingClientRect();
-      const before = e.clientY < rect.top + rect.height / 2;
-      chip.classList.toggle('nah-drag-over-top', before);
-      chip.classList.toggle('nah-drag-over-bottom', !before);
-    });
-    chip.addEventListener('dragleave', () => {
-      chip.classList.remove('nah-drag-over-top', 'nah-drag-over-bottom');
-    });
-    chip.addEventListener('drop', (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      chip.classList.remove('nah-drag-over-top', 'nah-drag-over-bottom');
-      const fromIdx = parseInt(e.dataTransfer.getData('text/plain'), 10);
-      if (Number.isNaN(fromIdx)) return;
-      const rect = chip.getBoundingClientRect();
-      const before = e.clientY < rect.top + rect.height / 2;
-      moveTag(fromIdx, before ? idx : idx + 1);
-      applyCurrentTagsToPrompt();
+    chip.addEventListener('click', () => {
+      selectedTagIndex = selectedTagIndex === origIdx ? null : origIdx;
       renderCurrentTags();
     });
 
-    const grip = document.createElement('span');
-    grip.className = 'nah-grip';
-    grip.textContent = '⋮⋮';
+    if (dragEnabled) {
+      chip.addEventListener('dragstart', (e) => {
+        e.dataTransfer.effectAllowed = 'move';
+        e.dataTransfer.setData('text/plain', String(origIdx));
+        chip.classList.add('nah-dragging');
+      });
+      chip.addEventListener('dragend', () => {
+        chip.classList.remove('nah-dragging');
+        listEl.querySelectorAll('.nah-drag-over-left, .nah-drag-over-right').forEach((el) => {
+          el.classList.remove('nah-drag-over-left', 'nah-drag-over-right');
+        });
+      });
+      chip.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        e.dataTransfer.dropEffect = 'move';
+        const rect = chip.getBoundingClientRect();
+        const before = e.clientX < rect.left + rect.width / 2;
+        chip.classList.toggle('nah-drag-over-left', before);
+        chip.classList.toggle('nah-drag-over-right', !before);
+      });
+      chip.addEventListener('dragleave', () => {
+        chip.classList.remove('nah-drag-over-left', 'nah-drag-over-right');
+      });
+      chip.addEventListener('drop', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        chip.classList.remove('nah-drag-over-left', 'nah-drag-over-right');
+        const fromIdx = parseInt(e.dataTransfer.getData('text/plain'), 10);
+        if (Number.isNaN(fromIdx)) return;
+        const rect = chip.getBoundingClientRect();
+        const before = e.clientX < rect.left + rect.width / 2;
+        selectedTagIndex = null;
+        moveTag(fromIdx, before ? origIdx : origIdx + 1);
+        applyCurrentTagsToPrompt();
+        renderCurrentTags();
+      });
+    }
 
     const text = document.createElement('span');
     text.className = 'nah-text';
     text.title = tag;
     text.textContent = tag;
 
-    const addBtn = document.createElement('button');
-    addBtn.className = 'nah-add';
-    addBtn.textContent = '즐겨찾기';
-    addBtn.addEventListener('click', () => addTagToFavorites(tag, currentPromptMode));
-
-    const deleteBtn = document.createElement('button');
-    deleteBtn.className = 'nah-remove';
-    deleteBtn.textContent = '삭제';
-    deleteBtn.addEventListener('click', () => {
-      currentTagsState.splice(idx, 1);
-      applyCurrentTagsToPrompt();
-      renderCurrentTags();
-      setStatus(`"${tag}" 삭제됨`);
-    });
-
-    chip.appendChild(grip);
     chip.appendChild(text);
-    chip.appendChild(addBtn);
-    chip.appendChild(deleteBtn);
     listEl.appendChild(chip);
   });
 }
@@ -907,6 +1162,7 @@ function loadCurrentTags() {
   populateTargetSelect();
   currentPromptMode = getActivePromptMode(currentPromptTarget);
   currentTagsState = getPromptTags(currentPromptTarget, currentPromptMode);
+  selectedTagIndex = null;
   renderCurrentTags();
   updateModeToggleButtons();
 }
@@ -934,6 +1190,7 @@ function setupCurrentTagsContainer(panel) {
     e.preventDefault();
     const fromIdx = parseInt(e.dataTransfer.getData('text/plain'), 10);
     if (Number.isNaN(fromIdx)) return;
+    selectedTagIndex = null;
     moveTag(fromIdx, currentTagsState.length);
     applyCurrentTagsToPrompt();
     renderCurrentTags();
@@ -1028,7 +1285,7 @@ function wirePanel(panel) {
     try {
       thumbnail = await createThumbnail(objectUrl);
     } catch (err) {
-      setStatus('이미지를 불러오지 못했어요.');
+      setPresetStatus('이미지를 불러오지 못했어요.', true);
       URL.revokeObjectURL(objectUrl);
       return;
     }
@@ -1040,12 +1297,13 @@ function wirePanel(panel) {
       presets[idx] = { ...presets[idx], thumbnail };
       chrome.storage.local.set({ presets }, () => {
         renderPresets(presets);
-        setStatus('이미지가 변경됐어요.');
+        setPresetStatus('프리셋 이미지가 변경됐어요.', false);
       });
     });
   });
 
   exportBtn.addEventListener('click', async () => {
+    if (!guardAlive(setBackupStatus)) return;
     const data = await new Promise((resolve) => {
       chrome.storage.local.get(['presets', 'tagFavorites'], resolve);
     });
@@ -1059,37 +1317,38 @@ function wirePanel(panel) {
     const payload = { presets, tagFavorites: data.tagFavorites || [] };
     try {
       exportCodeArea.value = await compressToCode(payload);
-      setStatus('코드 생성 완료 (이미지는 제외됨)');
+      setBackupStatus('코드 생성 완료 (이미지는 제외됨)', false);
     } catch (err) {
-      setStatus('코드 생성에 실패했어요.');
+      setBackupStatus('코드 생성에 실패했어요.', true);
     }
   });
 
   copyCodeBtn.addEventListener('click', async () => {
     if (!exportCodeArea.value) {
-      setStatus('먼저 코드 생성을 눌러주세요.');
+      setBackupStatus('먼저 코드 생성을 눌러주세요.', true);
       return;
     }
     try {
       await navigator.clipboard.writeText(exportCodeArea.value);
-      setStatus('클립보드에 복사됨');
+      setBackupStatus('클립보드에 복사했어요.', false);
     } catch (err) {
       exportCodeArea.select();
-      setStatus('복사가 안 되면 직접 선택해서 Ctrl+C 해주세요.');
+      setBackupStatus('복사가 안 되면 직접 선택해서 Ctrl+C 해주세요.', true);
     }
   });
 
   importBtn.addEventListener('click', async () => {
+    if (!guardAlive(setBackupStatus)) return;
     const code = importCodeArea.value.trim();
     if (!code) {
-      setStatus('붙여넣은 코드가 없어요.');
+      setBackupStatus('붙여넣은 코드가 없어요.', true);
       return;
     }
     let parsed;
     try {
       parsed = await decompressFromCode(code);
     } catch (err) {
-      setStatus('코드를 읽을 수 없어요 (형식 오류).');
+      setBackupStatus('코드를 읽을 수 없어요 (형식 오류).', true);
       return;
     }
     const incomingPresets = Array.isArray(parsed.presets) ? parsed.presets : [];
@@ -1101,7 +1360,7 @@ function wirePanel(panel) {
         renderPresets(presets);
         renderFavoriteTags(tagFavorites);
         importCodeArea.value = '';
-        setStatus(`가져오기 완료 (프리셋 +${incomingPresets.length}, 즐겨찾기 +${incomingFavorites.length})`);
+        setBackupStatus(`가져오기 완료 (프리셋 +${incomingPresets.length}, 즐겨찾기 +${incomingFavorites.length})`, false);
       });
     });
   });
@@ -1119,9 +1378,11 @@ function wirePanel(panel) {
   });
 
   savePresetBtn.addEventListener('click', async () => {
+    if (!guardAlive(setPresetStatus)) return;
     const name = presetNameEl.value.trim();
     if (!name) {
-      setStatus('프리셋 이름을 입력해주세요.');
+      setPresetStatus('프리셋 이름을 입력해주세요.', true);
+      presetNameEl.focus();
       return;
     }
     const scope = currentPromptTarget === 'base' ? 'base' : 'character';
@@ -1129,7 +1390,7 @@ function wirePanel(panel) {
     try {
       const { positiveText, negativeText } = await capturePositiveAndNegative(currentPromptTarget);
       if (!positiveText && !negativeText) {
-        setStatus('현재 프롬프트가 비어있어요.');
+        setPresetStatus('현재 프롬프트가 비어있어요.', true);
         return;
       }
       let thumbnail = null;
@@ -1154,7 +1415,7 @@ function wirePanel(panel) {
       await new Promise((resolve) => chrome.storage.local.set({ presets }, resolve));
       renderPresets(presets);
       presetNameEl.value = '';
-      setStatus(`"${name}" 저장됨 (${scope === 'character' ? '캐릭터용' : 'Base용'})`);
+      setPresetStatus(`"${name}" 저장됨 (${scope === 'character' ? '캐릭터용' : 'Base용'})`, false);
     } finally {
       savePresetBtn.disabled = false;
     }
@@ -1162,6 +1423,29 @@ function wirePanel(panel) {
 
   refreshTagsBtn.addEventListener('click', loadCurrentTags);
   closeBtn.addEventListener('click', () => togglePanel(false));
+
+  // 태그 검색 / 강조만 보기 / 선택 태그 액션 바
+  panel.querySelector('#nah-tag-search').addEventListener('input', (e) => {
+    tagSearchQuery = e.target.value;
+    renderCurrentTags();
+  });
+  panel.querySelector('#nah-weighted-only').addEventListener('change', (e) => {
+    weightedOnlyFilter = e.target.checked;
+    renderCurrentTags();
+  });
+  panel.querySelector('#nah-selected-fav').addEventListener('click', () => {
+    if (selectedTagIndex === null || selectedTagIndex >= currentTagsState.length) return;
+    addTagToFavorites(currentTagsState[selectedTagIndex], currentPromptMode);
+  });
+  panel.querySelector('#nah-selected-delete').addEventListener('click', () => {
+    if (selectedTagIndex === null || selectedTagIndex >= currentTagsState.length) return;
+    const tag = currentTagsState[selectedTagIndex];
+    currentTagsState.splice(selectedTagIndex, 1);
+    selectedTagIndex = null;
+    applyCurrentTagsToPrompt();
+    renderCurrentTags();
+    setTagsStatus(`"${tag}" 삭제했어요.`, false);
+  });
 
   panel.querySelector('#nah-mode-positive').addEventListener('click', async () => {
     if (!switchToPromptMode(currentPromptTarget, 'positive')) return;
@@ -1226,7 +1510,7 @@ function makeDraggable(panel) {
   document.addEventListener('mouseup', () => {
     if (!dragging) return;
     dragging = false;
-    chrome.storage.local.set({
+    safeStorageSet({
       panelPosition: { top: parseInt(panel.style.top, 10), left: parseInt(panel.style.left, 10) },
     });
   });
@@ -1266,7 +1550,7 @@ function watchResize(panel) {
       const width = Math.round(panel.offsetWidth);
       const height = Math.round(panel.offsetHeight);
       if (width <= 0 || height <= 0) return; // panel hidden (display:none)
-      chrome.storage.local.set({ panelSize: { width, height } });
+      safeStorageSet({ panelSize: { width, height } });
     }, 300);
   });
   ro.observe(panel);
@@ -1291,7 +1575,7 @@ function setupCollapsibleSections(panel) {
         if (e.target.closest('button')) return;
         collapsed[key] = !collapsed[key];
         applyState(toggle, collapsed[key]);
-        chrome.storage.local.set({ sectionCollapsed: collapsed });
+        safeStorageSet({ sectionCollapsed: collapsed });
       });
     });
   });
@@ -1303,7 +1587,7 @@ function togglePanel(forceState) {
   if (!panelEl) return;
   const shouldShow = forceState !== undefined ? forceState : panelEl.classList.contains('nah-hidden');
   panelEl.classList.toggle('nah-hidden', !shouldShow);
-  chrome.storage.local.set({ panelVisible: shouldShow });
+  safeStorageSet({ panelVisible: shouldShow });
   if (shouldShow) loadCurrentTagsWhenReady();
 }
 
