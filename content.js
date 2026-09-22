@@ -1,6 +1,19 @@
 // NovelAI 자동화 도우미 - content script (runs on https://novelai.net/*)
 
-let settingsCache = { autoGenerate: false, autoSave: false };
+const DEFAULT_OPUS_LIMIT_PERCENT = 10;
+
+let settingsCache = {
+  autoGenerate: false,
+  autoSave: false,
+  opusLimit: false,
+  opusLimitPercent: DEFAULT_OPUS_LIMIT_PERCENT,
+  anlasGuard: true, // 기본 켬 — 모르는 사이에 유료 생성이 돌아가는 쪽이 더 위험하다
+};
+
+// 저장된 적 없으면(undefined) 켬으로 본다. !! 로 읽으면 기본이 꺼짐이 되어버린다.
+function readAnlasGuard(value) {
+  return value !== false;
+}
 const savedImageSrcs = new Set();
 
 // 확장 프로그램이 리로드되면 탭에 남아있던 옛 content script의 chrome.* 호출이
@@ -27,9 +40,20 @@ let autoGenerateHoldUntil = 0;
 // 다음 자동 생성 클릭이 예약된 시각 (패널의 카운트다운 표시용).
 let nextGenerateAt = 0;
 
-chrome.storage.local.get(['autoGenerate', 'autoSave'], (data) => {
+const SETTING_KEYS = [
+  'autoGenerate',
+  'autoSave',
+  'opusLimit',
+  'opusLimitPercent',
+  'anlasGuard',
+];
+
+chrome.storage.local.get(SETTING_KEYS, (data) => {
   settingsCache.autoGenerate = !!data.autoGenerate;
   settingsCache.autoSave = !!data.autoSave;
+  settingsCache.opusLimit = !!data.opusLimit;
+  settingsCache.opusLimitPercent = clampPercent(data.opusLimitPercent);
+  settingsCache.anlasGuard = readAnlasGuard(data.anlasGuard);
   // 페이지를 새로고침했는데 자동 생성이 이미 켜져 있던 상태라면 이어서 시작하되,
   // 새로고침 직전에 걸어둔 생성이 아직 서버에서 돌고 있을 수 있으므로
   // (429 "Concurrent generation is locked" 방지) 8초 기다렸다가 시작한다.
@@ -52,6 +76,11 @@ chrome.storage.onChanged.addListener((changes, area) => {
     }
   }
   if ('autoSave' in changes) settingsCache.autoSave = !!changes.autoSave.newValue;
+  if ('opusLimit' in changes) settingsCache.opusLimit = !!changes.opusLimit.newValue;
+  if ('opusLimitPercent' in changes) {
+    settingsCache.opusLimitPercent = clampPercent(changes.opusLimitPercent.newValue);
+  }
+  if ('anlasGuard' in changes) settingsCache.anlasGuard = readAnlasGuard(changes.anlasGuard.newValue);
 });
 
 // "target" identifies WHICH prompt we're reading/writing: 'base' for the main
@@ -232,10 +261,171 @@ let missingGenerateButtonWarned = false;
 let generationInFlightSince = 0;
 const GENERATION_TIMEOUT_MS = 90000; // 완성 신호가 이만큼 안 오면 실패로 보고 재시도 허용
 
+// --- Opus 무료 생성 잔량(게이지) 감지 & 자동 정지 ---
+// NovelAI는 생성 패널에 "100% of Opus Generations remaining" 문구와 게이지를 띄운다.
+// 이 게이지가 바닥나면 그 다음 생성부터는 Anlas(유료 토큰)를 소모하므로,
+// 사용자가 정한 잔량(%) 이하로 떨어지면 자동 반복 생성을 스스로 끈다.
+//
+// 감지는 두 가지 신호를 함께 쓴다:
+//   1) 잔량 문구의 퍼센트 숫자 — 주 신호(임계값 비교).
+//   2) Generate 버튼에 붙는 Anlas 비용 배지 — 0이 아니면 이미 유료 생성이라는 뜻(최후 안전망).
+// 두 표시 모두 NovelAI가 언제든 구조를 바꿀 수 있으므로, 읽지 못하면 "계속"이 아니라
+// "멈춤"을 택한다 (모르는 사이에 Anlas가 새어나가는 것보다 안전).
+const OPUS_LINE_RE = /opus\s+generations?\s+remaining/i;
+const OPUS_PERCENT_RE = /(\d+(?:\.\d+)?)\s*%\s*of\s+opus\s+generations?\s+remaining/i;
+// 페이지 로드 직후엔 사이드바가 아직 안 그려져 있을 수 있어, 이 시간 동안은
+// 문구를 못 찾아도 멈추지 않고 클릭만 미룬다.
+const OPUS_DETECT_GRACE_MS = 15000;
+const pageLoadedAt = Date.now();
+
+let opusGaugeElCache = null;
+
+function clampPercent(value) {
+  // 입력칸을 비우고 나간 경우('')를 0%로 읽으면 '잔량 0%까지 계속'이 되어버린다.
+  if (value === '' || value === null || value === undefined) return DEFAULT_OPUS_LIMIT_PERCENT;
+  const n = Number(value);
+  if (!isFinite(n)) return DEFAULT_OPUS_LIMIT_PERCENT;
+  // 100%로 두면 켜는 즉시 멈추므로 상한은 99%.
+  return Math.min(99, Math.max(0, Math.round(n)));
+}
+
+function formatPercent(n) {
+  return Number.isInteger(n) ? String(n) : n.toFixed(1);
+}
+
+function flatText(el) {
+  return (el.textContent || '').replace(/\s+/g, ' ').trim();
+}
+
+// 실측(2026-09, novelai.net/image): 잔량 문구는 조상 요소까지 포함해 20개가 매칭되고,
+// 가장 안쪽은 텍스트가 딱 "100% of Opus Generations remaining"인 <span>(34자),
+// 가장 바깥은 Generate 버튼의 "26Anlas"까지 끌어안은 div.image-gen-footer(128자)다.
+// 그래서 문서 순서로 첫 번째를 잡으면 무관한 숫자가 섞인 바깥 요소를 고르게 된다.
+// → 가장 짧은(= 가장 안쪽) 매칭을 고른다.
+//
+// 또 퍼센트 숫자가 형제 요소로 쪼개져 있으면 안쪽 요소엔 문구만 남는데, 그걸 골라버리면
+// "숫자 없음 = 0%"로 읽혀 멀쩡한데도 멈춘다. 그래서 퍼센트까지 들어있는 요소를 우선하고,
+// 그런 요소가 문서에 하나도 없을 때만 문구만 있는 요소로 물러선다.
+function findOpusGaugeEl() {
+  if (opusGaugeElCache && opusGaugeElCache.isConnected && OPUS_LINE_RE.test(flatText(opusGaugeElCache))) {
+    return opusGaugeElCache;
+  }
+  opusGaugeElCache = null;
+  let best = null; // 퍼센트까지 들어있는 가장 짧은 요소
+  let bestLen = Infinity;
+  let loose = null; // 문구만 있는 가장 짧은 요소
+  let looseLen = Infinity;
+  const els = document.querySelectorAll('div, span, p, small, label, b, strong');
+  for (const el of els) {
+    const t = flatText(el);
+    // 페이지 전체를 감싸는 컨테이너까지 후보로 둘 필요는 없다.
+    if (!t || t.length > 400 || !OPUS_LINE_RE.test(t)) continue;
+    if (OPUS_PERCENT_RE.test(t)) {
+      if (t.length < bestLen) {
+        best = el;
+        bestLen = t.length;
+      }
+    } else if (t.length < looseLen) {
+      loose = el;
+      looseLen = t.length;
+    }
+  }
+  opusGaugeElCache = best || loose;
+  return opusGaugeElCache;
+}
+
+// Generate 버튼의 Anlas 비용. 0이면 무료(게이지로 커버됨), null이면 읽지 못함.
+function readGenerateAnlasCost() {
+  const btn = getGenerateButton();
+  if (!btn) return null;
+  const t = flatText(btn);
+  // "Generate 1 Image" / "Generate 4 Images" 뒤에 남는 첫 숫자가 Anlas 비용 배지다.
+  const rest = t.replace(/^Generate\s*(?:\d+\s*)?Images?/i, '');
+  if (rest === t) return null; // 예상한 버튼 문구 형태가 아님
+  const m = rest.match(/(\d[\d,]*)/);
+  return m ? Number(m[1].replace(/,/g, '')) : null;
+}
+
+// 잔량 퍼센트와 Anlas 비용을 함께 읽는다. 잔량 문구 자체를 못 찾으면 percent === null.
+function readOpusRemaining() {
+  const el = findOpusGaugeEl();
+  const anlas = readGenerateAnlasCost();
+  if (!el) return { percent: null, text: '', anlas };
+  const text = flatText(el);
+  const m = text.match(OPUS_PERCENT_RE);
+  // 문구는 찾았는데 숫자가 없으면(예: "No Opus Generations remaining") 소진으로 본다.
+  return { percent: m ? Number(m[1]) : 0, text, anlas };
+}
+
+// 자동 생성을 계속해도 되는지 판단한다.
+// 'go' = 계속, 'wait' = 이번 클릭만 건너뜀, 'stop' = 자동 생성 끄기
+// 두 안전망(잔량 임계값 / Anlas 비용)은 서로 독립이다. 실측에서 게이지가 100%인데도 Generate 버튼이
+// Anlas를 청구한다고 표시하는 상태가 있었고(로그인 직후 새로고침 전), 즉 두 신호는 어긋날 수 있어서
+// 한쪽을 끄고 다른 쪽만 쓸 수 있어야 한다.
+function checkOpusBudget() {
+  if (!settingsCache.opusLimit && !settingsCache.anlasGuard) return { action: 'go' };
+  const { percent, anlas } = readOpusRemaining();
+  const limit = clampPercent(settingsCache.opusLimitPercent);
+
+  if (settingsCache.anlasGuard && anlas !== null && anlas > 0) {
+    // 잔량은 넉넉한데 비용이 붙은 = 두 신호가 어긋난 상태. 로그인 직후 새로고침(F5) 전에는
+    // 실제로 무료인데도 비용이 표시되는 경우가 있어서(실측), 그 가능성을 안내에 같이 적는다.
+    // 임계값을 쓰는 중이면 "임계값보다 넉넉한가", 안 쓰면 "게이지에 조금이라도 남았는가"가 기준이다.
+    const gaugeFloor = settingsCache.opusLimit ? limit : 0;
+    const disagree = percent !== null && percent > gaugeFloor;
+    return {
+      action: 'stop',
+      reason:
+        `이번 생성이 Anlas ${anlas}을(를) 소모하는 유료 생성이라 자동 반복 생성을 멈췄어요.` +
+        (disagree
+          ? ` 그런데 잔량은 ${formatPercent(percent)}% 남아있어요 — 로그인 직후 새로고침(F5) 전이면` +
+            ' 비용이 잘못 표시될 수 있으니, 새로고침한 뒤 다시 켜보세요.'
+          : ''),
+    };
+  }
+  if (!settingsCache.opusLimit) return { action: 'go' };
+  if (percent !== null) {
+    if (percent <= limit) {
+      return {
+        action: 'stop',
+        reason: `Opus 무료 생성 잔량 ${formatPercent(percent)}% — 설정한 ${limit}% 이하라서 자동 반복 생성을 멈췄어요.`,
+      };
+    }
+    return { action: 'go' };
+  }
+  // 잔량 문구를 못 찾았다 = 판단 근거가 없다. 로드 직후면 잠깐 기다리고, 그래도 없으면 멈춘다.
+  if (Date.now() - pageLoadedAt < OPUS_DETECT_GRACE_MS) return { action: 'wait' };
+  return {
+    action: 'stop',
+    reason:
+      'Opus 잔량 표시("% of Opus Generations remaining")를 찾지 못해 안전하게 멈췄어요. ' +
+      '화면에 잔량 게이지가 보이는지 확인하거나, 이 옵션을 끄고 사용해주세요.',
+  };
+}
+
+// 자동 반복 생성을 끄고(체크박스/저장소까지) 이유를 패널에 남긴다.
+function stopAutoGenerate(reason) {
+  clearTimeout(nextGenerateTimer);
+  nextGenerateAt = 0;
+  settingsCache.autoGenerate = false;
+  safeStorageSet({ autoGenerate: false });
+  const cb = document.getElementById('nah-auto-generate');
+  if (cb) cb.checked = false;
+  // 자리를 비운 사이에 멈췄을 수 있으니 이 메시지는 자동으로 지우지 않는다.
+  setAutoStatus(reason, true, true);
+  console.warn('[NovelAI 도우미]', reason);
+}
+
 function tryAutoGenerateClick() {
   if (!settingsCache.autoGenerate) return;
   if (Date.now() < autoGenerateHoldUntil) return;
   if (generationInFlightSince && Date.now() - generationInFlightSince < GENERATION_TIMEOUT_MS) return;
+  const budget = checkOpusBudget();
+  if (budget.action === 'stop') {
+    stopAutoGenerate(budget.reason);
+    return;
+  }
+  if (budget.action === 'wait') return;
   const btn = getGenerateButton();
   if (btn && !btn.disabled) {
     btn.click();
@@ -281,8 +471,8 @@ function addTagToPrompt(tag, target, mode) {
 let consecutive429 = 0;
 let last429At = 0;
 
-function setAutoStatus(text, isError) {
-  setInlineStatus('nah-auto-status', text, isError);
+function setAutoStatus(text, isError, persist) {
+  setInlineStatus('nah-auto-status', text, isError, persist);
 }
 
 function onGenerationError() {
@@ -295,11 +485,7 @@ function onGenerationError() {
   clearTimeout(nextGenerateTimer);
   if (consecutive429 >= 3) {
     consecutive429 = 0;
-    safeStorageSet({ autoGenerate: false });
-    const cb = document.getElementById('nah-auto-generate');
-    if (cb) cb.checked = false;
-    setAutoStatus('생성 잠금(429)이 연속 3회 발생해 자동 반복 생성을 껐어요. 잠시 후 직접 다시 켜주세요.', true);
-    console.warn('[NovelAI 도우미] 429 연속 발생 — 자동 반복 생성을 자동으로 껐어요.');
+    stopAutoGenerate('생성 잠금(429)이 연속 3회 발생해 자동 반복 생성을 껐어요. 잠시 후 직접 다시 켜주세요.');
     return;
   }
   const backoff = 15000 * consecutive429;
@@ -312,6 +498,26 @@ function onGenerationError() {
 // --- Auto-generate: 폴링 대신 이미지 완성 이벤트(onImageGenerated)를 신호로 다음 생성을 건다.
 // 생성이 실패해 이미지가 끝내 안 뜨는 경우를 대비한 저빈도 안전망만 유지한다.
 setInterval(tryAutoGenerateClick, 5000);
+
+// --- Opus 잔량 표시 갱신 ---
+// DOM 전체를 훑어야 하므로 카운트다운(0.1초)과 달리 1초 간격, 패널이 열려 있을 때만 돈다.
+setInterval(() => {
+  const el = document.getElementById('nah-opus-remain');
+  if (!el || !panelEl || panelEl.classList.contains('nah-hidden')) return;
+  const { percent, text, anlas } = readOpusRemaining();
+  const limit = clampPercent(settingsCache.opusLimitPercent);
+  if (percent === null) {
+    el.textContent = '잔량 ?';
+    el.title = 'Opus 잔량 문구를 찾지 못했어요. NovelAI 화면에 게이지가 보이는지 확인해주세요.';
+    el.className = 'nah-opus-unknown';
+    return;
+  }
+  const paid = anlas !== null && anlas > 0;
+  el.textContent = `잔량 ${formatPercent(percent)}%` + (paid ? ` · Anlas ${anlas}` : '');
+  el.title = text + (anlas === null ? '' : `\nGenerate 버튼 Anlas 비용: ${anlas}`);
+  const low = (paid && settingsCache.anlasGuard) || percent <= (settingsCache.opusLimit ? limit + 5 : 10);
+  el.className = low ? 'nah-opus-low' : '';
+}, 1000);
 
 // --- 다음 생성까지 남은 시간 표시 (0.1초 단위) ---
 setInterval(() => {
@@ -481,6 +687,9 @@ const PANEL_STYLES = `
 #nah-header .nah-title { font-weight: 600; color: #f5d76e; font-size: 13px; }
 #nah-version { font-size: 11px; color: #7a7a99; }
 #nah-next-gen { font-size: 11px; color: #f5d76e; }
+#nah-opus-remain { font-size: 11px; color: #7bd8a5; white-space: nowrap; }
+#nah-opus-remain.nah-opus-low { color: #f0997b; font-weight: 600; }
+#nah-opus-remain.nah-opus-unknown { color: #7a7a99; }
 #nah-close {
   background: transparent;
   border: none;
@@ -500,6 +709,17 @@ const PANEL_STYLES = `
   border-bottom: 1px solid #33334d;
 }
 #nah-panel .nah-row label { cursor: pointer; }
+#nah-panel .nah-row.nah-row-wrap { flex-wrap: wrap; row-gap: 4px; }
+#nah-panel .nah-subrow {
+  display: flex; align-items: center; gap: 5px; flex-wrap: wrap;
+  padding: 0 0 7px; border-bottom: 1px solid #33334d;
+  font-size: 12px; color: #b9b9d6;
+}
+#nah-panel .nah-subrow.nah-dim { opacity: 0.45; }
+#nah-panel .nah-subrow input[type="number"] {
+  width: 54px; background: #262640; border: 1px solid #3a3a5c;
+  color: #e6e6f0; border-radius: 4px; padding: 3px 5px; font-size: 12px;
+}
 #nah-panel section {
   margin-top: 10px; background: #20203a; border: 1px solid #2c2c48;
   border-radius: 8px; padding: 10px 12px;
@@ -656,6 +876,22 @@ function buildPanel() {
           <input type="checkbox" id="nah-auto-generate" />
         </span>
       </div>
+      <div class="nah-row nah-row-wrap">
+        <label for="nah-opus-limit" title="Opus 무료 생성 게이지가 설정한 잔량 이하로 떨어지면 자동 반복 생성을 끕니다.">Opus 잔량 제한</label>
+        <span style="display:flex; align-items:center; gap:8px;">
+          <span id="nah-opus-remain"></span>
+          <input type="checkbox" id="nah-opus-limit" />
+        </span>
+      </div>
+      <div class="nah-subrow" id="nah-opus-subrow">
+        <label for="nah-opus-percent">잔량</label>
+        <input type="number" id="nah-opus-percent" min="0" max="99" step="1" />
+        <span>% 이하면 자동 정지</span>
+      </div>
+      <div class="nah-subrow" id="nah-anlas-subrow">
+        <input type="checkbox" id="nah-anlas-guard" />
+        <label for="nah-anlas-guard" title="Generate 버튼에 Anlas 비용이 표시되면(0이 아니면) 잔량과 무관하게 정지합니다. 게이지가 100%여도 유료로 청구되는 설정이 있어서 따로 끌 수 있게 했어요.">Anlas 비용이 붙으면 정지</label>
+      </div>
       <div class="nah-row">
         <label for="nah-auto-save">자동 저장 (다운로드)</label>
         <input type="checkbox" id="nah-auto-save" />
@@ -748,12 +984,14 @@ function setStatus(text) {
 // 각 카드(섹션) 안에 표시되는 상태 메시지. 에러는 빨간 강조, 일반 안내는 초록.
 // 카드마다 타이머를 따로 관리해 서로 지우지 않게 한다.
 const inlineStatusTimers = {};
-function setInlineStatus(elId, text, isError) {
+function setInlineStatus(elId, text, isError, persist) {
   const el = document.getElementById(elId);
   if (!el) return;
   clearTimeout(inlineStatusTimers[elId]);
   el.textContent = text;
   el.className = `nah-inline-status ${isError ? 'nah-error' : 'nah-info'}`;
+  // persist=true면 놓치면 안 되는 안내(자동 생성 정지 등)라 자동으로 지우지 않는다.
+  if (persist) return;
   inlineStatusTimers[elId] = setTimeout(() => {
     el.textContent = '';
     el.className = 'nah-inline-status';
@@ -1267,6 +1505,10 @@ function mergeFavorites(existing, incoming) {
 function wirePanel(panel) {
   const autoGenerateEl = panel.querySelector('#nah-auto-generate');
   const autoSaveEl = panel.querySelector('#nah-auto-save');
+  const opusLimitEl = panel.querySelector('#nah-opus-limit');
+  const opusPercentEl = panel.querySelector('#nah-opus-percent');
+  const opusSubrowEl = panel.querySelector('#nah-opus-subrow');
+  const anlasGuardEl = panel.querySelector('#nah-anlas-guard');
   const presetNameEl = panel.querySelector('#nah-preset-name');
   const savePresetBtn = panel.querySelector('#nah-save-preset');
   const closeBtn = panel.querySelector('#nah-close');
@@ -1371,13 +1613,35 @@ function wirePanel(panel) {
     });
   });
 
-  chrome.storage.local.get(['autoGenerate', 'autoSave'], (data) => {
+  // 임계값 입력칸은 제한이 꺼져 있으면 흐리게 + 비활성화한다.
+  function syncOpusRow() {
+    opusPercentEl.disabled = !opusLimitEl.checked;
+    opusSubrowEl.classList.toggle('nah-dim', !opusLimitEl.checked);
+  }
+
+  chrome.storage.local.get(SETTING_KEYS, (data) => {
     autoGenerateEl.checked = !!data.autoGenerate;
     autoSaveEl.checked = !!data.autoSave;
+    opusLimitEl.checked = !!data.opusLimit;
+    opusPercentEl.value = clampPercent(data.opusLimitPercent);
+    anlasGuardEl.checked = readAnlasGuard(data.anlasGuard);
+    syncOpusRow();
   });
 
   autoGenerateEl.addEventListener('change', () => {
     chrome.storage.local.set({ autoGenerate: autoGenerateEl.checked });
+  });
+  opusLimitEl.addEventListener('change', () => {
+    syncOpusRow();
+    safeStorageSet({ opusLimit: opusLimitEl.checked });
+  });
+  opusPercentEl.addEventListener('change', () => {
+    const value = clampPercent(opusPercentEl.value);
+    opusPercentEl.value = value;
+    safeStorageSet({ opusLimitPercent: value });
+  });
+  anlasGuardEl.addEventListener('change', () => {
+    safeStorageSet({ anlasGuard: anlasGuardEl.checked });
   });
   autoSaveEl.addEventListener('change', () => {
     chrome.storage.local.set({ autoSave: autoSaveEl.checked });

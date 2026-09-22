@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "NovelAI 자동화 도우미",
-  "version": "1.12.2",
+  "version": "1.13.0",
   "description": "NovelAI 이미지 생성 페이지에서 자동 생성/저장, 캐릭터별 포지티브·네거티브 프롬프트 편집, 태그 즐겨찾기, 프롬프트 프리셋, 코드 백업/복원 기능을 제공합니다.",
   "permissions": ["storage", "downloads", "unlimitedStorage"],
   "host_permissions": ["https://novelai.net/*"],
